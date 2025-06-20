@@ -1,0 +1,88 @@
+import streamlit as st
+import whisper
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+import ssl
+
+# 修复 SSL 证书错误（临时方案，生产环境建议更新根证书）
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# 设置页面标题和布局
+st.set_page_config(page_title="ChatPPT Assistant", layout="wide")
+st.title("🎤 ChatPPT Assistant: Voice & Text Interaction")
+
+# 初始化聊天历史
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# 侧边栏配置
+with st.sidebar:
+    st.header("Settings")
+    input_mode = st.radio("Input Mode", ["Text", "Voice"])
+
+# --- 模型加载（缓存避免重复加载）---
+@st.cache_resource
+def load_whisper_model():
+    return whisper.load_model("base")  # 可选 "small", "medium"
+
+@st.cache_resource
+def load_minicpm_model():
+    model_name = "openbmb/MiniCPM-2B-dpo-fp16"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)  # 关键修复
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        torch_dtype=torch.float16  # 半精度节省显存
+    )
+    return model, tokenizer
+
+# 加载模型（带进度提示）
+with st.spinner("Loading models..."):
+    try:
+        whisper_model = load_whisper_model()
+        minicpm_model, minicpm_tokenizer = load_minicpm_model()
+    except Exception as e:
+        st.error(f"Model loading failed: {str(e)}")
+        st.stop()
+
+# --- 功能函数 ---
+def transcribe_audio(audio_path):
+    result = whisper_model.transcribe(audio_path)
+    return result["text"]
+
+def generate_text(prompt):
+    inputs = minicpm_tokenizer(prompt, return_tensors="pt").to("cuda")
+    outputs = minicpm_model.generate(**inputs, max_length=200)
+    return minicpm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# --- 主交互界面 ---
+# 显示历史消息
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# 输入处理
+if input_mode == "Voice":
+    uploaded_audio = st.file_uploader("Upload Audio (MP3/WAV)", type=["wav", "mp3"])
+    if uploaded_audio:
+        with st.spinner("Transcribing..."):
+            text = transcribe_audio(uploaded_audio.name)
+            st.session_state.messages.append({"role": "user", "content": text})
+            with st.chat_message("user"):
+                st.markdown(text)
+else:
+    if prompt := st.chat_input("Type your question..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+# 生成回复
+if st.session_state.messages and st.session_state.messages[-1]["role"] != "assistant":
+    with st.chat_message("assistant"):
+        with st.spinner("Generating..."):
+            try:
+                full_response = generate_text(st.session_state.messages[-1]["content"])
+                st.markdown(full_response)
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+            except Exception as e:
+                st.error(f"Generation failed: {str(e)}")
