@@ -1,0 +1,16 @@
+class ReportComposer:
+    def __init__(self):
+        self.templates = {
+            "商业报告": "1. 执行摘要\n2. 市场分析...",
+            "学术论文": "1. Abstract\n2. Literature Review..."
+        }
+    
+    def compose(self, data, style):
+        return llm.fill_template(
+            template=self.templates[style],
+            data=data,
+            style_rules={
+                "学术": "被动语态，第三人称",
+                "商业": "直接结论先行"
+            }
+        )
