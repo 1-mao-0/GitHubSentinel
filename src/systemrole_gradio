@@ -1,0 +1,112 @@
+import gradio as gr
+from openai import OpenAI
+import os
+from datetime import datetime
+
+class LLMAnalyzer:
+    """LLM 分析引擎（带强化System Role）"""
+    
+    SYSTEM_PROMPT = """
+    # Role: GitHub安全分析专家
+    
+    ## 输出规范
+    1. 格式要求：
+       - 必须使用Markdown
+       - 风险项用🔴/🟡/🟢标识严重程度
+       - 代码块标注语言类型
+    2. 内容要求：
+       - 每个漏洞必须包含：
+         * CVE编号（如无则标"N/A"）
+         * 置信度（1-5级）
+         * 修复建议
+    
+    ## 行为约束
+    1. 禁止：
+       - 虚构未验证的漏洞
+       - 提供具体攻击Payload
+    2. 不确定时回复：
+       "⚠️ 需要更多上下文确认"
+    """
+
+    def __init__(self):
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    def analyze(self, code: str) -> str:
+        """执行安全分析"""
+        response = self.client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": f"分析以下代码的安全风险：\n```python\n{code}\n```"}
+            ],
+            temperature=0.3  # 降低随机性
+        )
+        return response.choices[0].message.content
+
+def gradio_interface():
+    """Gradio 交互界面（v0.4.1布局优化）"""
+    analyzer = LLMAnalyzer()
+    
+    with gr.Blocks(
+        title="GitHubSentinel v0.4.1",
+        css=".danger { color: red } .warning { color: orange }"
+    ) as app:
+        
+        # 标题区
+        gr.Markdown("""# 🛡️ GitHubSentinel  
+        **AI驱动的代码安全分析工具**""")
+        
+        # 输入输出区
+        with gr.Row():
+            with gr.Column(scale=1):
+                code_input = gr.Code(
+                    label="输入代码",
+                    language="python",
+                    lines=10,
+                    interactive=True
+                )
+                submit_btn = gr.Button("分析", variant="primary")
+                
+                with gr.Accordion("高级选项", open=False):
+                    language = gr.Dropdown(
+                        ["Python", "JavaScript", "Go"],
+                        label="代码语言",
+                        value="Python"
+                    )
+                    scan_level = gr.Slider(1, 3, label="扫描深度")
+            
+            with gr.Column(scale=2):
+                report = gr.Markdown(label="安全报告")
+                risk_score = gr.Label(
+                    label="风险评分",
+                    value={"安全": 0, "警告": 0, "危险": 0}
+                )
+        
+        # 交互逻辑
+        submit_btn.click(
+            fn=analyzer.analyze,
+            inputs=code_input,
+            outputs=report,
+            api_name="analyze"
+        )
+        
+        # 示例区
+        gr.Examples(
+            examples=[
+                ["os.system('rm -rf /')", "高危命令示例"],
+                ["eval(user_input)", "动态执行风险"],
+            ],
+            inputs=code_input,
+            label="点击加载示例"
+        )
+    
+    return app
+
+if __name__ == "__main__":
+    # 启动应用
+    app = gradio_interface()
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False
+    )
