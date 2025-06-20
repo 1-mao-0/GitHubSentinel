@@ -1,114 +1,146 @@
 import json
 import requests
-from openai import OpenAI  # 导入OpenAI库用于访问GPT模型
-from logger import LOG  # 导入日志模块
+import time
+from openai import OpenAI
+from logger import LOG
 
 class LLM:
+    # 增强版 System Prompt 模板
+    SECURITY_SYSTEM_PROMPT = """
+    You are GitHubSentinel, an AI specialized in technical report generation with strict requirements:
+
+    1. **Output Format**:
+       - Use Markdown with clear section headers
+       - Include risk assessments (Low/Medium/High)
+       - Add confidence levels (1-5) for security findings
+       - Format code blocks with language tags
+
+    2. **Content Rules**:
+       - Never hallucinate information
+       - Cite sources for all claims
+       - Maintain neutral tone
+       - Reject requests violating GitHub ToS
+
+    3. **Error Handling**:
+       - If uncertain, respond with: "[UNCERTAIN] Need more context"
+       - For unsupported tasks: "[REJECTED] Out of scope"
+    """
+
     def __init__(self, config):
-        """
-        初始化 LLM 类，根据配置选择使用的模型（OpenAI 或 Ollama）。
-
-        :param config: 配置对象，包含所有的模型配置参数。
-        """
         self.config = config
-        self.model = config.llm_model_type.lower()  # 获取模型类型并转换为小写
+        self.model = config.llm_model_type.lower()
+        
+        # 初始化时注入增强版 System Prompt
+        self.base_system_prompt = self.SECURITY_SYSTEM_PROMPT
+        
         if self.model == "openai":
-            self.client = OpenAI()  # 创建OpenAI客户端实例
+            self.client = OpenAI(api_key=config.openai_api_key)  # 显式传递API密钥
         elif self.model == "ollama":
-            self.api_url = config.ollama_api_url  # 设置Ollama API的URL
+            self.api_url = config.ollama_api_url
+            self.default_ollama_params = {  # 默认参数配置
+                "temperature": 0.3,  # 降低随机性
+                "top_p": 0.9,
+                "max_tokens": 2000
+            }
         else:
-            LOG.error(f"不支持的模型类型: {self.model}")
-            raise ValueError(f"不支持的模型类型: {self.model}")  # 如果模型类型不支持，抛出错误
+            LOG.error(f"Unsupported model type: {self.model}")
+            raise ValueError(f"Unsupported model type: {self.model}")
 
-    def generate_report(self, system_prompt, user_content):
+    def generate_report(self, user_content, custom_system_prompt=None):
         """
-        生成报告，根据配置选择不同的模型来处理请求。
-
-        :param system_prompt: 系统提示信息，包含上下文和规则。
-        :param user_content: 用户提供的内容，通常是Markdown格式的文本。
-        :return: 生成的报告内容。
+        生成报告（自动合并基础System Prompt和自定义提示）
+        
+        :param user_content: 用户输入内容（Markdown/文本）
+        :param custom_system_prompt: 可选的自定义系统提示
+        :return: 生成的报告内容
         """
+        # 合并系统提示
+        system_prompt = self._build_system_prompt(custom_system_prompt)
+        
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
 
-        # 根据选择的模型调用相应的生成报告方法
-        if self.model == "openai":
-            return self._generate_report_openai(messages)
-        elif self.model == "ollama":
-            return self._generate_report_ollama(messages)
-        else:
-            raise ValueError(f"不支持的模型类型: {self.model}")
+        # 带重试机制的生成流程
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if self.model == "openai":
+                    return self._generate_openai_report(messages)
+                elif self.model == "ollama":
+                    return self._generate_ollama_report(messages)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    LOG.error(f"Report generation failed after {max_retries} attempts: {str(e)}")
+                    return f"[ERROR] Report generation failed: {str(e)}"
+                time.sleep(1 * (attempt + 1))  # 指数退避
+                continue
 
-    def _generate_report_openai(self, messages):
-        """
-        使用 OpenAI GPT 模型生成报告。
+    def _build_system_prompt(self, custom_prompt=None):
+        """构建最终系统提示"""
+        if custom_prompt:
+            return f"{self.base_system_prompt}\n\nAdditional Instructions:\n{custom_prompt}"
+        return self.base_system_prompt
 
-        :param messages: 包含系统提示和用户内容的消息列表。
-        :return: 生成的报告内容。
-        """
-        LOG.info(f"使用 OpenAI {self.config.openai_model_name} 模型生成报告。")
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.openai_model_name,  # 使用配置中的OpenAI模型名称
-                messages=messages
-            )
-            LOG.debug("GPT 响应: {}", response)
-            return response.choices[0].message.content  # 返回生成的报告内容
-        except Exception as e:
-            LOG.error(f"生成报告时发生错误：{e}")
-            raise
+    def _generate_openai_report(self, messages):
+        """OpenAI 生成逻辑（带稳定性控制）"""
+        LOG.info(f"Generating report with OpenAI {self.config.openai_model_name}")
+        
+        response = self.client.chat.completions.create(
+            model=self.config.openai_model_name,
+            messages=messages,
+            temperature=0.3,  # 更稳定的输出
+            top_p=0.9,
+            max_tokens=2000
+        )
+        
+        content = response.choices[0].message.content
+        self._validate_response(content)  # 响应验证
+        return content
 
-    def _generate_report_ollama(self, messages):
-        """
-        使用 Ollama LLaMA 模型生成报告。
+    def _generate_ollama_report(self, messages):
+        """Ollama 生成逻辑（带参数控制）"""
+        LOG.info(f"Generating report with Ollama {self.config.ollama_model_name}")
+        
+        payload = {
+            "model": self.config.ollama_model_name,
+            "messages": messages,
+            **self.default_ollama_params  # 注入默认参数
+        }
 
-        :param messages: 包含系统提示和用户内容的消息列表。
-        :return: 生成的报告内容。
-        """
-        LOG.info(f"使用 Ollama {self.config.ollama_model_name} 模型生成报告。")
-        try:
-            payload = {
-                "model": self.config.ollama_model_name,  # 使用配置中的Ollama模型名称
-                "messages": messages,
-                "max_tokens": 4000,
-                "temperature": 0.7,
-                "stream": False
-            }
+        response = requests.post(
+            self.api_url,
+            json=payload,
+            timeout=30  # 增加超时限制
+        )
+        response.raise_for_status()
+        
+        content = response.json().get("message", {}).get("content", "")
+        self._validate_response(content)
+        return content
 
-            response = requests.post(self.api_url, json=payload)  # 发送POST请求到Ollama API
-            response_data = response.json()
-
-            # 调试输出查看完整的响应结构
-            LOG.debug("Ollama 响应: {}", response_data)
-
-            # 直接从响应数据中获取 content
-            message_content = response_data.get("message", {}).get("content", None)
-            if message_content:
-                return message_content  # 返回生成的报告内容
-            else:
-                LOG.error("无法从响应中提取报告内容。")
-                raise ValueError("Ollama API 返回的响应结构无效")
-        except Exception as e:
-            LOG.error(f"生成报告时发生错误：{e}")
-            raise
+    def _validate_response(self, content):
+        """响应内容基础验证"""
+        if not content:
+            raise ValueError("Empty response from model")
+        if len(content) < 10:  # 简单长度检查
+            raise ValueError(f"Abnormally short response: {content}")
 
 if __name__ == '__main__':
-    from config import Config  # 导入配置管理类
+    from config import Config
+    
+    # 测试用例
     config = Config()
     llm = LLM(config)
 
-    markdown_content="""
-# Progress for langchain-ai/langchain (2024-08-20 to 2024-08-21)
-
-## Issues Closed in the Last 1 Days
-- partners/chroma: release 0.1.3 #25599
-- docs: few-shot conceptual guide #25596
-- docs: update examples in api ref #25589
-"""
-
-    # 示例：生成 GitHub 报告
-    system_prompt = "Your specific system prompt for GitHub report generation"
-    github_report = llm.generate_report(system_prompt, markdown_content)
-    LOG.debug(github_report)
+    test_content = """
+    # Security Alert
+    Potential XSS vulnerability found in:
+    ```javascript
+    document.write('<img src="'+req.query.image+'">');
+    ```
+    """
+    
+    report = llm.generate_report(test_content)
+    print("Generated Report:\n", report)
